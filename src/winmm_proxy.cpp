@@ -5360,6 +5360,10 @@ std::filesystem::path GetMapPackDiskPath() {
             return candidate.parent_path().parent_path() / L"garrysmod" / L"cache" / L"map_pack.bsp";
         }
     }
+    std::error_code ec;
+    if (std::filesystem::is_directory(g_dllDir / L"garrysmod", ec)) {
+        return g_dllDir / L"garrysmod" / L"cache" / L"map_pack.bsp";
+    }
     return {};
 }
 
@@ -9372,7 +9376,7 @@ void WriteCrashReportAndDump(EXCEPTION_POINTERS* ep, const char* sourceTag) {
         char buf[640];
         std::snprintf(buf, sizeof(buf),
             "[%04u-%02u-%02u %02u:%02u:%02u] CRASH[%s] PID=%u TID=%u (%s) | code=0x%08lX | addr=0x%llX (%s) | "
-            "ver=v16.4 | ram=%s->%s (load=%lu%%, avail=%lluMB/%lluMB) | guard=L%u | storage=%s | profiler=%s\n",
+            "ver=v16.5 | ram=%s->%s (load=%lu%%, avail=%lluMB/%lluMB) | guard=L%u | storage=%s | profiler=%s\n",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
             sourceTag ? sourceTag : "?",
             static_cast<unsigned>(g_processPid),
@@ -9462,7 +9466,8 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
     }
 
     InitPathsAndConfig();
-    if (g_processExeName != "gmod.exe" && g_processExeName != "srcds.exe") {
+    if (g_processExeName != "gmod.exe" && g_processExeName != "gmod_win64.exe" &&
+        g_processExeName != "srcds.exe" && g_processExeName != "srcds_win64.exe") {
         WriteStatusLog("Non-game process detected; proxy pass-through only (no hooks).");
         return 0;
     }
@@ -9483,7 +9488,7 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
         WriteStatusLog("Storage detected: SSD / NVMe (seek penalty=false).");
     }
 
-    WriteStatusLog(std::string("winmm.dll optimizer+profiler v16.4 initialized (optimizer=") +
+    WriteStatusLog(std::string("winmm.dll optimizer+profiler v16.5 initialized (optimizer=") +
                    (g_cfg.enableOptimizer ? "ON" : "OFF") +
                    ", profiler=" + (g_cfg.profilerEnabled ? "ON" : "OFF") +
                    ", ram_profile=" + g_cfg.ramProfile + "->" + g_effectiveRamProfile +

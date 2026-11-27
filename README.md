@@ -4,8 +4,8 @@ Speeds up heavy maps and addon packs without touching game files or visuals
 
 ## Install
 
-1. Switch Garry's Mod to the `x86-64 - Chromium + 64-bit binaries` Steam beta
-2. Put `winmm.dll` into `GarrysMod\bin\win64\winmm.dll`
+1. Launch Garry's Mod in 64-bit mode
+2. Put `winmm.dll` into `Steam\steamapps\common\GarrysMod\winmm.dll`
 3. Launch the game
 
 ## Update Resilience
