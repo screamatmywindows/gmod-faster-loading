@@ -6838,7 +6838,8 @@ void FinalizeSessionAsyncOrSync(const std::string& reason, bool sync) {
         (reason == "post_spawn_tail_complete" ||
          reason == "mp_lightmaps_tail_complete" ||
          reason == "mp_compact_tail_complete" ||
-         reason == "mp_lua_startup_timeout");
+         reason == "mp_lua_startup_timeout" ||
+         reason == "no_listener_timeout");
     if (isNormalComplete && g_session.mapName != "unknown_map") {
         g_loadedMapName = g_session.mapName;
         g_inGameOnMap = true;
@@ -7323,14 +7324,15 @@ using FnFlush         = void(*)(void* self, void* file);
 using FnFileExists    = bool(*)(void* self, const char* pFileName, const char* pPathID);
 using FnGetFileTime   = long(*)(void* self, const char* pFileName, const char* pPathID);
 
-// Verified against win64/filesystem_stdio.dll (CFileSystem_Stdio vtables 0xaf6e0 & 0xafb88)
-constexpr size_t kVtableIdxSetBufferSize = 24; // +0x0c0 primary
-constexpr size_t kVtableIdxIsOk          = 25; // +0x0c8 primary
-constexpr size_t kVtableIdxEndOfFile     = 26; // +0x0d0 primary
-constexpr size_t kVtableIdxReadLine      = 27; // +0x0d8 primary
-constexpr size_t kVtableIdxFindFirstEx   = 35; // +0x118 primary
-constexpr size_t kVtableIdxOpenEx        = 73; // +0x248 primary
-constexpr size_t kVtableIdxReadEx        = 74; // +0x250 primary
+// v16.6: Dynamically resolved at runtime from IBaseFileSystem::Open (subVt[2]) & Read (subVt[0]) thunks!
+// Automatically supports BOTH x86-64 beta (OpenEx=73, shift=0) AND main branch gmod_win64.exe (OpenEx=69, shift=-4).
+size_t g_vtableIdxSetBufferSize = 24;
+size_t g_vtableIdxIsOk          = 25;
+size_t g_vtableIdxEndOfFile     = 26;
+size_t g_vtableIdxReadLine      = 27;
+size_t g_vtableIdxFindFirstEx   = 35;
+size_t g_vtableIdxOpenEx        = 73;
+size_t g_vtableIdxReadEx        = 74;
 
 constexpr size_t kSubVtableIdxWrite      = 1;  // +0x008 sub (+0x8)
 constexpr size_t kSubVtableIdxClose      = 3;  // +0x018 sub (+0x8)
@@ -8926,6 +8928,22 @@ static bool ProbeFileSystemAbiSeh(void* subThis, void* fnExistsPtr, void* fnTime
     return ok;
 }
 
+static size_t ExtractVtableCallSlotFromThunk(const void* fnPtr) noexcept {
+    if (!fnPtr) return 0;
+    const auto* b = reinterpret_cast<const uint8_t*>(fnPtr);
+    // Scan x64 thunk for `call qword ptr [rax + disp32]` (FF 90) or `jmp qword ptr [rax + disp32]` (FF A0)
+    for (size_t i = 0; i + 6 <= 48; ++i) {
+        if (b[i] == 0xFF && (b[i + 1] == 0x90 || b[i + 1] == 0xA0)) {
+            uint32_t disp = 0;
+            std::memcpy(&disp, b + i + 2, sizeof(disp));
+            if (disp >= 0x80 && disp <= 0x600 && (disp % 8U) == 0U) {
+                return static_cast<size_t>(disp / 8U);
+            }
+        }
+    }
+    return 0;
+}
+
 bool TryInstallFilesystemHook() {
     HMODULE hFs = GetModuleHandleW(L"filesystem_stdio.dll");
     if (!hFs) return false;
@@ -8966,13 +8984,52 @@ bool TryInstallFilesystemHook() {
         return true;
     }
 
-    if (!IsAddressInModule(primaryVt[kVtableIdxSetBufferSize], hFs) ||
-        !IsAddressInModule(primaryVt[kVtableIdxIsOk], hFs) ||
-        !IsAddressInModule(primaryVt[kVtableIdxEndOfFile], hFs) ||
-        !IsAddressInModule(primaryVt[kVtableIdxReadLine], hFs) ||
-        !IsAddressInModule(primaryVt[kVtableIdxOpenEx], hFs) ||
-        !IsAddressInModule(primaryVt[kVtableIdxReadEx], hFs) ||
-        !IsAddressInModule(primaryVt[kVtableIdxFindFirstEx], hFs) ||
+    // v16.6: Auto-detect primary vtable slot shift from IBaseFileSystem::Read (subVt[0]) & Open (subVt[2]) thunks.
+    // Beta x86-64: OpenEx=73, ReadEx=74 (shift=0). Main branch gmod_win64.exe: OpenEx=69, ReadEx=70 (shift=-4).
+    const size_t detectedReadEx = IsAddressInModule(subVt[0], hFs) ? ExtractVtableCallSlotFromThunk(subVt[0]) : 0;
+    const size_t detectedOpenEx = IsAddressInModule(subVt[2], hFs) ? ExtractVtableCallSlotFromThunk(subVt[2]) : 0;
+    if (detectedOpenEx == 0 || detectedReadEx != detectedOpenEx + 1 || detectedOpenEx < 50 || detectedOpenEx > 120) {
+        WriteStatusLog("WARNING: Could not auto-detect IFileSystem OpenEx/ReadEx vtable slots (open=" +
+                       std::to_string(detectedOpenEx) + ", read=" + std::to_string(detectedReadEx) +
+                       "); vtable hooks skipped safely (Win32 IAT optimizations remain active).");
+        return true;
+    }
+    const int primaryShift = static_cast<int>(detectedOpenEx) - 73;
+    if (primaryShift < -16 || primaryShift > 16) {
+        WriteStatusLog("WARNING: Unexpected IFileSystem primary vtable shift (" + std::to_string(primaryShift) +
+                       "); vtable hooks skipped safely.");
+        return true;
+    }
+    g_vtableIdxSetBufferSize = static_cast<size_t>(24 + primaryShift);
+    g_vtableIdxIsOk          = static_cast<size_t>(25 + primaryShift);
+    g_vtableIdxEndOfFile     = static_cast<size_t>(26 + primaryShift);
+    g_vtableIdxReadLine      = static_cast<size_t>(27 + primaryShift);
+    g_vtableIdxFindFirstEx   = static_cast<size_t>(35 + primaryShift);
+    g_vtableIdxOpenEx        = detectedOpenEx;
+    g_vtableIdxReadEx        = detectedReadEx;
+
+    // Cross-check FindFirst (FindFirstEx - 4) thunk jumps directly to FindFirstEx!
+    const size_t findFirstSlot = g_vtableIdxFindFirstEx - 4;
+    const size_t crossFindEx = IsAddressInModule(primaryVt[findFirstSlot], hFs)
+                               ? ExtractVtableCallSlotFromThunk(primaryVt[findFirstSlot]) : 0;
+    if (crossFindEx != g_vtableIdxFindFirstEx) {
+        WriteStatusLog("WARNING: IFileSystem FindFirst->FindFirstEx cross-check failed (expected=" +
+                       std::to_string(g_vtableIdxFindFirstEx) + ", got=" + std::to_string(crossFindEx) +
+                       "); vtable hooks skipped safely.");
+        return true;
+    }
+    WriteStatusLog("IFileSystem vtable auto-detected: shift=" + std::to_string(primaryShift) +
+                   " (OpenEx=" + std::to_string(g_vtableIdxOpenEx) +
+                   ", ReadEx=" + std::to_string(g_vtableIdxReadEx) +
+                   ", FindFirstEx=" + std::to_string(g_vtableIdxFindFirstEx) + ").");
+
+    if (!IsAddressInModule(primaryVt[g_vtableIdxSetBufferSize], hFs) ||
+        !IsAddressInModule(primaryVt[g_vtableIdxIsOk], hFs) ||
+        !IsAddressInModule(primaryVt[g_vtableIdxEndOfFile], hFs) ||
+        !IsAddressInModule(primaryVt[g_vtableIdxReadLine], hFs) ||
+        !IsAddressInModule(primaryVt[g_vtableIdxOpenEx], hFs) ||
+        !IsAddressInModule(primaryVt[g_vtableIdxReadEx], hFs) ||
+        !IsAddressInModule(primaryVt[g_vtableIdxFindFirstEx], hFs) ||
         !IsAddressInModule(subVt[kSubVtableIdxWrite], hFs) ||
         !IsAddressInModule(subVt[kSubVtableIdxClose], hFs) ||
         !IsAddressInModule(subVt[kSubVtableIdxSeek], hFs) ||
@@ -8988,7 +9045,7 @@ bool TryInstallFilesystemHook() {
 
     // Live non-destructive ABI self-test on FileExists(10) and GetFileTime(13) before patching any slot
     const bool distinctSlots =
-        (primaryVt[kVtableIdxOpenEx] != primaryVt[kVtableIdxReadEx]) &&
+        (primaryVt[g_vtableIdxOpenEx] != primaryVt[g_vtableIdxReadEx]) &&
         (subVt[kSubVtableIdxExists] != subVt[kSubVtableIdxFileTime]) &&
         (subVt[kSubVtableIdxClose] != subVt[kSubVtableIdxSeek]);
 
@@ -9010,12 +9067,12 @@ bool TryInstallFilesystemHook() {
 
     // Hook handle-consuming methods BEFORE OpenEx so no virtual handle can ever reach an unhooked slot
     int okCount = 0;
-    okCount += hookSlot(primaryVt, kVtableIdxSetBufferSize, reinterpret_cast<void*>(&HookedSetBufferSize), g_origSetBufferSize) ? 1 : 0;
-    okCount += hookSlot(primaryVt, kVtableIdxIsOk,          reinterpret_cast<void*>(&HookedIsOk),          g_origIsOk) ? 1 : 0;
-    okCount += hookSlot(primaryVt, kVtableIdxEndOfFile,     reinterpret_cast<void*>(&HookedEndOfFile),     g_origEndOfFile) ? 1 : 0;
-    okCount += hookSlot(primaryVt, kVtableIdxReadLine,      reinterpret_cast<void*>(&HookedReadLine),      g_origReadLine) ? 1 : 0;
-    okCount += hookSlot(primaryVt, kVtableIdxFindFirstEx,   reinterpret_cast<void*>(&HookedFindFirstEx),   g_origFindFirstEx) ? 1 : 0;
-    okCount += hookSlot(primaryVt, kVtableIdxReadEx,        reinterpret_cast<void*>(&HookedReadEx),        g_origReadEx) ? 1 : 0;
+    okCount += hookSlot(primaryVt, g_vtableIdxSetBufferSize, reinterpret_cast<void*>(&HookedSetBufferSize), g_origSetBufferSize) ? 1 : 0;
+    okCount += hookSlot(primaryVt, g_vtableIdxIsOk,          reinterpret_cast<void*>(&HookedIsOk),          g_origIsOk) ? 1 : 0;
+    okCount += hookSlot(primaryVt, g_vtableIdxEndOfFile,     reinterpret_cast<void*>(&HookedEndOfFile),     g_origEndOfFile) ? 1 : 0;
+    okCount += hookSlot(primaryVt, g_vtableIdxReadLine,      reinterpret_cast<void*>(&HookedReadLine),      g_origReadLine) ? 1 : 0;
+    okCount += hookSlot(primaryVt, g_vtableIdxFindFirstEx,   reinterpret_cast<void*>(&HookedFindFirstEx),   g_origFindFirstEx) ? 1 : 0;
+    okCount += hookSlot(primaryVt, g_vtableIdxReadEx,        reinterpret_cast<void*>(&HookedReadEx),        g_origReadEx) ? 1 : 0;
     okCount += hookSlot(subVt,     kSubVtableIdxWrite,      reinterpret_cast<void*>(&HookedWrite),         g_origWrite) ? 1 : 0;
     okCount += hookSlot(subVt,     kSubVtableIdxClose,      reinterpret_cast<void*>(&HookedClose),         g_origClose) ? 1 : 0;
     okCount += hookSlot(subVt,     kSubVtableIdxSeek,       reinterpret_cast<void*>(&HookedSeek),          g_origSeek) ? 1 : 0;
@@ -9025,7 +9082,7 @@ bool TryInstallFilesystemHook() {
     okCount += hookSlot(subVt,     kSubVtableIdxFlush,      reinterpret_cast<void*>(&HookedFlush),         g_origFlush) ? 1 : 0;
     okCount += hookSlot(subVt,     kSubVtableIdxExists,     reinterpret_cast<void*>(&HookedFileExists),    g_origFileExists) ? 1 : 0;
     okCount += hookSlot(subVt,     kSubVtableIdxFileTime,   reinterpret_cast<void*>(&HookedGetFileTime),   g_origGetFileTime) ? 1 : 0;
-    okCount += hookSlot(primaryVt, kVtableIdxOpenEx,        reinterpret_cast<void*>(&HookedOpenEx),        g_origOpenEx) ? 1 : 0;
+    okCount += hookSlot(primaryVt, g_vtableIdxOpenEx,        reinterpret_cast<void*>(&HookedOpenEx),        g_origOpenEx) ? 1 : 0;
 
     g_fsPrimaryVtable = primaryVt;
     g_fsSubVtable = subVt;
@@ -9376,7 +9433,7 @@ void WriteCrashReportAndDump(EXCEPTION_POINTERS* ep, const char* sourceTag) {
         char buf[640];
         std::snprintf(buf, sizeof(buf),
             "[%04u-%02u-%02u %02u:%02u:%02u] CRASH[%s] PID=%u TID=%u (%s) | code=0x%08lX | addr=0x%llX (%s) | "
-            "ver=v16.5 | ram=%s->%s (load=%lu%%, avail=%lluMB/%lluMB) | guard=L%u | storage=%s | profiler=%s\n",
+            "ver=v16.7 | ram=%s->%s (load=%lu%%, avail=%lluMB/%lluMB) | guard=L%u | storage=%s | profiler=%s\n",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
             sourceTag ? sourceTag : "?",
             static_cast<unsigned>(g_processPid),
@@ -9488,7 +9545,7 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
         WriteStatusLog("Storage detected: SSD / NVMe (seek penalty=false).");
     }
 
-    WriteStatusLog(std::string("winmm.dll optimizer+profiler v16.5 initialized (optimizer=") +
+    WriteStatusLog(std::string("winmm.dll optimizer+profiler v16.7 initialized (optimizer=") +
                    (g_cfg.enableOptimizer ? "ON" : "OFF") +
                    ", profiler=" + (g_cfg.profilerEnabled ? "ON" : "OFF") +
                    ", ram_profile=" + g_cfg.ramProfile + "->" + g_effectiveRamProfile +
@@ -9515,6 +9572,7 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
         g_samplerThread = CreateThread(nullptr, 0, SamplerThreadProc, nullptr, 0, nullptr);
     }
 
+    bool tier0Checked = false;
     bool fsHooked = false;
     bool launcherIatHooked = false;
     bool engineIatHooked = false;
@@ -9526,9 +9584,10 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
     ULONGLONG lastRamCheckTick = 0;
 
     while (!g_shuttingDown.load(std::memory_order_relaxed)) {
-        if (!g_listenerRegistered) {
+        if (!tier0Checked) {
             HMODULE hTier0 = GetModuleHandleW(L"tier0.dll");
             if (hTier0) {
+                tier0Checked = true;
                 g_fnRegisterListener = reinterpret_cast<FnRegisterLoggingListener>(
                     GetProcAddress(hTier0, "LoggingSystem_RegisterLoggingListener"));
                 g_fnUnregisterListener = reinterpret_cast<FnUnregisterLoggingListener>(
@@ -9537,13 +9596,15 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
                     g_fnRegisterListener(&g_listenerObj);
                     g_listenerRegistered = true;
                     WriteStatusLog("tier0.dll LoggingSystem listener registered.");
-                    if (g_cfg.enableOptimizer && g_cfg.optVirtualFreeQuarantine) {
-                        bool okVf = PatchModuleIat(hTier0, "KERNEL32.dll", "VirtualFree",
-                                                   reinterpret_cast<void*>(&HookedTier0VirtualFree),
-                                                   reinterpret_cast<void**>(&g_origTier0VirtualFree));
-                        if (okVf) g_tier0ModForIat = hTier0;
-                        WriteStatusLog(std::string("tier0.dll IAT hook VirtualFree=") + (okVf ? "OK" : "NOT_FOUND"));
-                    }
+                } else {
+                    WriteStatusLog("tier0.dll LoggingSystem not exported (main branch); running without console listener.");
+                }
+                if (g_cfg.enableOptimizer && g_cfg.optVirtualFreeQuarantine) {
+                    bool okVf = PatchModuleIat(hTier0, "KERNEL32.dll", "VirtualFree",
+                                               reinterpret_cast<void*>(&HookedTier0VirtualFree),
+                                               reinterpret_cast<void**>(&g_origTier0VirtualFree));
+                    if (okVf) g_tier0ModForIat = hTier0;
+                    WriteStatusLog(std::string("tier0.dll IAT hook VirtualFree=") + (okVf ? "OK" : "NOT_FOUND"));
                 }
             }
         }
@@ -9559,15 +9620,19 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
             }
         }
 
-        if (g_listenerRegistered && !engineIatHooked) {
+        if (!engineIatHooked) {
             HMODULE hEngine = GetModuleHandleW(L"engine.dll");
             if (hEngine) {
-                bool okR = PatchModuleIat(hEngine, "tier0.dll", "LoggingSystem_ResetCurrentLoggingState",
-                                          reinterpret_cast<void*>(&HookedResetCurrentLoggingState),
-                                          reinterpret_cast<void**>(&g_origResetLoggingState));
-                bool okP = PatchModuleIat(hEngine, "tier0.dll", "LoggingSystem_PushLoggingState",
-                                          reinterpret_cast<void*>(&HookedPushLoggingState),
-                                          reinterpret_cast<void**>(&g_origPushLoggingState));
+                bool okR = false;
+                bool okP = false;
+                if (g_listenerRegistered) {
+                    okR = PatchModuleIat(hEngine, "tier0.dll", "LoggingSystem_ResetCurrentLoggingState",
+                                         reinterpret_cast<void*>(&HookedResetCurrentLoggingState),
+                                         reinterpret_cast<void**>(&g_origResetLoggingState));
+                    okP = PatchModuleIat(hEngine, "tier0.dll", "LoggingSystem_PushLoggingState",
+                                         reinterpret_cast<void*>(&HookedPushLoggingState),
+                                         reinterpret_cast<void**>(&g_origPushLoggingState));
+                }
                 int engFs = 0;
                 if (g_cfg.enableOptimizer && g_cfg.optDirCache && g_cfg.optExtraDllDirCache) {
                     g_engineModForIat = hEngine;
@@ -9575,10 +9640,10 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
                     engFs += PatchModuleIat(hEngine, "KERNEL32.dll", "CreateFileW", reinterpret_cast<void*>(&HookedEngineCreateFileW), reinterpret_cast<void**>(&g_origEngineCreateFileW)) ? 1 : 0;
                 }
                 engineIatHooked = true;
-                WriteStatusLog(std::string("engine.dll IAT hooks: Reset=") + (okR ? "OK" : "NOT_FOUND") +
-                               ", Push=" + (okP ? "OK" : "NOT_FOUND") +
+                WriteStatusLog(std::string("engine.dll IAT hooks: Reset=") + (okR ? "OK" : "N/A") +
+                               ", Push=" + (okP ? "OK" : "N/A") +
                                ", DirCacheCreateFile=" + std::to_string(engFs));
-                if (!engineReRegistered && g_fnRegisterListener &&
+                if (g_listenerRegistered && !engineReRegistered && g_fnRegisterListener &&
                     g_logMessagesReceived.load(std::memory_order_relaxed) == 0) {
                     g_fnRegisterListener(&g_listenerObj);
                     engineReRegistered = true;
@@ -9678,7 +9743,9 @@ DWORD WINAPI WatcherThreadProc(LPVOID) {
             }
             if (!flushReason) {
                 double sinceStartMs = g_timer.DeltaUs(g_session.startTick, nowTk) / 1000.0;
-                if (sinceStartMs >= 180000.0) {
+                if (!g_listenerRegistered && sinceStartMs >= 45000.0) {
+                    flushReason = "no_listener_timeout";
+                } else if (sinceStartMs >= 180000.0) {
                     flushReason = "session_hard_timeout";
                 }
             }
@@ -9712,13 +9779,13 @@ void CleanupOnDetach() {
     HMODULE hFsAlive = g_fsModuleHandle ? GetModuleHandleW(L"filesystem_stdio.dll") : nullptr;
     if (hFsAlive && hFsAlive == g_fsModuleHandle) {
         if (g_fsPrimaryVtable) {
-            if (g_origOpenEx)        PatchVtableSlot(g_fsPrimaryVtable, kVtableIdxOpenEx, reinterpret_cast<void*>(g_origOpenEx), nullptr);
-            if (g_origReadEx)        PatchVtableSlot(g_fsPrimaryVtable, kVtableIdxReadEx, reinterpret_cast<void*>(g_origReadEx), nullptr);
-            if (g_origFindFirstEx)   PatchVtableSlot(g_fsPrimaryVtable, kVtableIdxFindFirstEx, reinterpret_cast<void*>(g_origFindFirstEx), nullptr);
-            if (g_origSetBufferSize) PatchVtableSlot(g_fsPrimaryVtable, kVtableIdxSetBufferSize, reinterpret_cast<void*>(g_origSetBufferSize), nullptr);
-            if (g_origIsOk)          PatchVtableSlot(g_fsPrimaryVtable, kVtableIdxIsOk, reinterpret_cast<void*>(g_origIsOk), nullptr);
-            if (g_origEndOfFile)     PatchVtableSlot(g_fsPrimaryVtable, kVtableIdxEndOfFile, reinterpret_cast<void*>(g_origEndOfFile), nullptr);
-            if (g_origReadLine)      PatchVtableSlot(g_fsPrimaryVtable, kVtableIdxReadLine, reinterpret_cast<void*>(g_origReadLine), nullptr);
+            if (g_origOpenEx)        PatchVtableSlot(g_fsPrimaryVtable, g_vtableIdxOpenEx, reinterpret_cast<void*>(g_origOpenEx), nullptr);
+            if (g_origReadEx)        PatchVtableSlot(g_fsPrimaryVtable, g_vtableIdxReadEx, reinterpret_cast<void*>(g_origReadEx), nullptr);
+            if (g_origFindFirstEx)   PatchVtableSlot(g_fsPrimaryVtable, g_vtableIdxFindFirstEx, reinterpret_cast<void*>(g_origFindFirstEx), nullptr);
+            if (g_origSetBufferSize) PatchVtableSlot(g_fsPrimaryVtable, g_vtableIdxSetBufferSize, reinterpret_cast<void*>(g_origSetBufferSize), nullptr);
+            if (g_origIsOk)          PatchVtableSlot(g_fsPrimaryVtable, g_vtableIdxIsOk, reinterpret_cast<void*>(g_origIsOk), nullptr);
+            if (g_origEndOfFile)     PatchVtableSlot(g_fsPrimaryVtable, g_vtableIdxEndOfFile, reinterpret_cast<void*>(g_origEndOfFile), nullptr);
+            if (g_origReadLine)      PatchVtableSlot(g_fsPrimaryVtable, g_vtableIdxReadLine, reinterpret_cast<void*>(g_origReadLine), nullptr);
         }
         if (g_fsSubVtable) {
             if (g_origWrite)         PatchVtableSlot(g_fsSubVtable, kSubVtableIdxWrite, reinterpret_cast<void*>(g_origWrite), nullptr);
