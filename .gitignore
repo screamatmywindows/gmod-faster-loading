@@ -1,0 +1,10 @@
+build/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.dll
+gmod_load_logs/
+gmod_load_optimizer.ini
+src/winmm_exports.inc
+src/winmm_proxy.def
